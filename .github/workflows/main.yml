@@ -1,13 +1,13 @@
-name: Persistent RDP with Tailscale
+name: Auto-Restart RDP
 on:
   workflow_dispatch:   # Manual start
-  schedule:
+  schedule:           # Auto-restart every 3 days
     - cron: "0 0 */3 * *"  # Every 3 days at midnight UTC
 
 jobs:
-  persistent-rdp:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 4320  # Maximum 72 hours per workflow run
+    timeout-minutes: 4320  # 3 days max
 
     steps:
       - name: Configure Core RDP Settings
@@ -49,7 +49,7 @@ jobs:
 
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Install or Update Tailscale
+      - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
@@ -57,47 +57,56 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish & Maintain Tailscale Connection
+      - name: Establish Tailscale Connection
         run: |
           $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-
+          
           function Connect-Tailscale {
-              try {
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$hostname --accept-routes --accept-dns=false
-              } catch {
-                  Write-Host "Failed to start Tailscale, retrying..."
-                  Start-Sleep -Seconds 10
-              }
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=$hostname --accept-routes --accept-dns=false
               Start-Sleep -Seconds 5
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               return $tsIP
           }
 
-          # Infinite loop to keep RDP + Tailscale alive
-          while ($true) {
-              # Ensure Tailscale is connected
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
               $tsIP = Connect-Tailscale
-              if (-not $tsIP) {
-                  Write-Host "Tailscale IP not assigned, retrying in 10 sec..."
-                  Start-Sleep -Seconds 10
-                  continue
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain RDP & Tailscale Connection
+        run: |
+          while ($true) {
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              if ($tsStatus -notmatch "100\.100") {
+                  Write-Host "Tailscale disconnected, reconnecting..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" down
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --accept-dns=false
               }
 
-              # Check RDP connectivity
-              $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
-              if (-not $testResult.TcpTestSucceeded) {
-                  Write-Host "RDP port not reachable, retrying..."
-                  Start-Sleep -Seconds 10
-                  continue
-              }
-
-              # Display RDP info
               Write-Host "`n=== RDP ACCESS ==="
-              Write-Host "Address: $tsIP"
+              Write-Host "Address: $env:TAILSCALE_IP"
               Write-Host "Username: RDP"
               Write-Host "Password: $env:RDP_PASSWORD"
               Write-Host "==================`n"
 
-              Start-Sleep -Seconds 300  # 5 min check interval
+              Start-Sleep -Seconds 300
           }
